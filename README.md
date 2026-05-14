@@ -24,9 +24,9 @@ If you apply the same human-driven review process to all three, you burn senior 
 This lab builds an agent that auto-triages every PR:
 
 1. The LLM reads the diff and produces a structured review with a **self-reported confidence score**.
-2. **Confidence ≥ 85%** → the agent posts the review comment itself; no human in the loop.
-3. **60–85%** → the agent pauses (`interrupt()`) and shows the reviewer the diff + LLM reasoning + a one-click **approve / reject / edit** panel. On approve, the comment posts.
-4. **< 60%** → the agent **escalates**. It shows the reviewer *specific questions the LLM is uncertain about* ("Why MD5? Is `SYNC_URL` meant to be HTTPS in production?") and waits for answers. Then it re-asks the LLM with the answers in context and posts a **refined** review.
+2. **Confidence > 72%** → the agent posts the review comment itself; no human in the loop.
+3. **58–72%** → the agent pauses (`interrupt()`) and shows the reviewer the diff + LLM reasoning + a one-click **approve / reject / edit** panel. On approve, the comment posts.
+4. **< 58%** → the agent **escalates strongly**. It shows the reviewer *specific questions the LLM is uncertain about* ("Why MD5? Is `SYNC_URL` meant to be HTTPS in production?") and waits for answers. Then it re-asks the LLM with the answers in context and posts a **refined** review.
 
 Every step writes a row to a structured audit table — every routing decision, every human interaction, every LLM call — so the team can replay any session for compliance or debugging.
 
@@ -36,9 +36,9 @@ Every step writes a row to a structured audit table — every routing decision, 
 flowchart TD
     Fetch[fetch_pr] --> Analyze[analyze]
     Analyze --> Route{confidence}
-    Route -- "≥ 85%" --> Auto[auto_approve]
-    Route -- "60–85%" --> Human["human_approval<br/>(interrupt)"]
-    Route -- "< 60%" --> Escalate["escalate<br/>(interrupt)"]
+    Route -- "> 72%" --> Auto[auto_approve]
+    Route -- "58–72%" --> Human["human_approval<br/>(interrupt)"]
+    Route -- "< 58%" --> Escalate["escalate<br/>(interrupt)"]
     Escalate --> Synth[synthesize]
     Auto --> Commit[commit]
     Human --> Commit
@@ -59,30 +59,17 @@ Every node also writes one row to `audit_events`. The graph state is persisted b
 
 **What this scaffolding already covers.** Exercises 1–4 deliver the HITL agent, confidence-based routing, and the structured audit trail. Two implementation notes:
 - The lab uses **SQLite** (`./hitl_audit.db`) instead of PostgreSQL for zero-setup. The schema is row-oriented with first-class columns — the same `AuditEntry` queries transfer to Postgres in production by swapping the checkpointer and connection string.
-- The approval UI is currently a terminal panel (Rich). You need to add the Streamlit UI yourself — see the TODO below.
-
-### Your additional TODO — Streamlit approval UI
-
-Replace (or wrap) the terminal UI with a **Streamlit** app that drives the same `interrupt()` / `Command(resume=...)` flow:
-
-- New file: `app.py` at the repo root, launched with `streamlit run app.py`.
-- A form to enter a PR URL → trigger `node_fetch_pr` → `node_analyze`.
-- When the graph hits `interrupt()` with an `approval_request`, render the diff + LLM summary + confidence + a panel with **Approve / Reject / Edit** buttons. On click, resume the graph via `Command(resume=...)`.
-- When the kind is `escalation`, render the LLM's questions as form fields, collect answers, resume with the dict.
-- Persist `thread_id` in `st.session_state` so refreshing the page keeps the session alive.
-- Add `streamlit` to `pyproject.toml` dependencies.
-
-Demo PRs (PR-Demo #1 and #2 below) should drive the human_approval and escalate branches respectively.
+- The approval UI is currently a terminal panel (Rich). The Streamlit UI is the fifth exercise — see [Exercise 5](#exercise-5--streamlit-approval-ui-apppy) below.
 
 ## Confidence routing
 
 | Confidence  | Branch           | Has HITL?                          | Demo PR |
 |-------------|------------------|------------------------------------|---------|
-| ≥ 85%       | `auto_approve`   | No — agent commits directly        | (use any tiny PR) |
-| 60–85%      | `human_approval` | Yes — approve / reject / edit      | PR-Demo #1 |
-| < 60%       | `escalate`       | Yes — answer specific questions    | PR-Demo #2 |
+| > 72%       | `auto_approve`   | No — agent commits directly        | (use any tiny PR) |
+| 58–72%      | `human_approval` | Yes — approve / reject / edit      | PR-Demo #1 |
+| < 58%       | `escalate`       | Yes — answer specific questions    | PR-Demo #2 |
 
-Thresholds live in `common/schemas.py` (`AUTO_APPROVE_THRESHOLD = 0.85`, `ESCALATE_THRESHOLD = 0.60`).
+Thresholds live in `common/schemas.py` (`AUTO_APPROVE_THRESHOLD = 0.73`, `ESCALATE_THRESHOLD = 0.58`).
 
 ## Layout
 
@@ -157,12 +144,12 @@ Two PRs are kept at the public repo **<https://github.com/VinUni-AI20k/PR-Demo>*
 
 | PR | URL                                                                  | Expected branch          |
 |----|----------------------------------------------------------------------|--------------------------|
-| #1 — Add task priority field        | `https://github.com/VinUni-AI20k/PR-Demo/pull/1` | `human_approval` (~70%) |
-| #2 — Add user login + cloud sync    | `https://github.com/VinUni-AI20k/PR-Demo/pull/2` | `escalate` (<60%)       |
+| #1 — Add task priority field        | `https://github.com/VinUni-AI20k/PR-Demo/pull/1` | `human_approval` (~65%) |
+| #2 — Add user login + cloud sync    | `https://github.com/VinUni-AI20k/PR-Demo/pull/2` | `escalate` (<58%)       |
 
 PR #1 is mechanical (~40 lines) with one open question (schema migration). PR #2 has multiple red flags (MD5 password hashing, plaintext token storage, SQL injection in `Storage.add`, hard-coded user_id, no tests for new code) — the LLM should drop into the escalate branch and ask the reviewer specific questions.
 
-## The 4 exercises
+## The 5 exercises
 
 Do them in order — each builds on the previous. Open the file, read all `# TODO:` comments top-to-bottom, fill them in, then run the command shown.
 
@@ -248,6 +235,38 @@ uv run python -m audit.replay --list   # see recent threads
 
 Both live in the same `./hitl_audit.db` file. The assignment line "ghi vào audit trail" is fulfilled by `audit_events`. The checkpointer is a free bonus from using `AsyncSqliteSaver`.
 
+### Exercise 5 — Streamlit approval UI (`app.py`)
+
+The final assembly: wrap the LangGraph from exercises 1–4 into a **Streamlit** web UI so a reviewer can drive the whole flow from a browser instead of a terminal.
+
+The same three confidence buckets apply, but the *human experience* changes per bucket:
+
+| Confidence | Branch | What the reviewer sees in the UI |
+|---|---|---|
+| **> 72%** | `auto_approve` | A success card: confidence + LLM summary + a "View comment on GitHub" link. Reviewer does **nothing** — agent already posted. |
+| **58–72%** | `human_approval` | The normal approval card: diff, LLM reasoning, list of comments + three buttons **Approve / Reject / Edit**. One click and the comment posts. |
+| **< 58%** | `escalate` | The strong-escalation card: risk factors highlighted + a form with the LLM's specific questions. Reviewer fills answers, agent re-synthesizes, then shows the refined review for a final confirm. |
+
+**You implement** (`app.py` at the repo root):
+
+- A PR URL input form → trigger the graph.
+- An `interrupt()` handler that renders the right card depending on `payload["kind"]` (`approval_request` vs `escalation`).
+- A resume call: `app.ainvoke(Command(resume=user_choice_or_answers), cfg)`.
+- `thread_id` persisted in `st.session_state` so reloading the page or jumping back to it keeps the session.
+- A small "recent sessions" sidebar driven by `audit.replay.list_threads`.
+- Add `streamlit` to `pyproject.toml` dependencies.
+
+A skeleton with `# TODO:` markers is provided in `app.py`. Run with:
+
+```bash
+uv run streamlit run app.py
+```
+
+The skeleton wires up the Streamlit boilerplate (session state, page layout, top-level form). You fill in:
+- The graph invocation
+- The two interrupt renderers (`render_approval_card`, `render_escalation_card`)
+- The resume logic
+
 ## How the assignment maps to files
 
 | Assignment line                                       | Where you implement it                              |
@@ -257,6 +276,7 @@ Both live in the same `./hitl_audit.db` file. The assignment line "ghi vào audi
 | 72% → diff + reasoning → user approves → commit       | `exercise_2_hitl.py`                                |
 | 58% → escalate with specific questions                | `exercise_3_escalation.py`                          |
 | Audit trail + replay full session                     | `exercise_4_audit.py`, `audit/schema.sql`, `audit/replay.py` |
+| Streamlit approval UI (final assembly)                | `app.py`                                            |
 
 ## Bonus challenges
 
@@ -280,7 +300,7 @@ Side-effects placed *before* `interrupt()` in the same node — the node re-runs
 Token lacks `public_repo` scope, or repo is private and you only have `public_repo`. Re-create the PAT with the right scope.
 
 **LLM stays overconfident on PR #2 and never escalates.**
-Temporarily raise `ESCALATE_THRESHOLD` in `common/schemas.py` to 0.75 to force the branch.
+Temporarily raise `ESCALATE_THRESHOLD` in `common/schemas.py` to 0.70 to force the branch.
 
 **`audit_events` schema is stale after a code change.**
 The schema is created idempotently on first connection. To reset state completely, just delete the file:
