@@ -9,6 +9,33 @@ A 2-hour lab that builds a human-in-the-loop pull-request review agent in **Lang
 
 Students complete **4 exercises** (`exercises/`) that together build the full system. Each exercise has a runnable skeleton with `# TODO:` markers — your job is to fill them in.
 
+## Lab assignment
+
+**Goal:** Build a HITL agent with LangGraph `interrupt()` **+ a Streamlit approval UI**.
+
+**Deliverables:**
+- HITL agent
+- Approval UI (Streamlit)
+- Confidence-based routing
+- PostgreSQL audit trail
+
+**What this scaffolding already covers.** Exercises 1–4 deliver the HITL agent, confidence-based routing, and the structured audit trail. Two implementation notes:
+- The lab uses **SQLite** (`./hitl_audit.db`) instead of PostgreSQL for zero-setup. The schema is row-oriented with first-class columns — the same `AuditEntry` queries transfer to Postgres in production by swapping the checkpointer and connection string.
+- The approval UI is currently a terminal panel (Rich). You need to add the Streamlit UI yourself — see the TODO below.
+
+### Your additional TODO — Streamlit approval UI
+
+Replace (or wrap) the terminal UI with a **Streamlit** app that drives the same `interrupt()` / `Command(resume=...)` flow:
+
+- New file: `app.py` at the repo root, launched with `streamlit run app.py`.
+- A form to enter a PR URL → trigger `node_fetch_pr` → `node_analyze`.
+- When the graph hits `interrupt()` with an `approval_request`, render the diff + LLM summary + confidence + a panel with **Approve / Reject / Edit** buttons. On click, resume the graph via `Command(resume=...)`.
+- When the kind is `escalation`, render the LLM's questions as form fields, collect answers, resume with the dict.
+- Persist `thread_id` in `st.session_state` so refreshing the page keeps the session alive.
+- Add `streamlit` to `pyproject.toml` dependencies.
+
+Demo PRs (PR-Demo #1 and #2 below) should drive the human_approval and escalate branches respectively.
+
 ## Confidence routing
 
 | Confidence  | Branch           | Has HITL?                          | Demo PR |
