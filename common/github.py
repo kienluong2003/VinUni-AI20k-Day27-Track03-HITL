@@ -1,18 +1,19 @@
-"""Thin wrapper around the `gh` CLI to fetch PR metadata and diffs.
+"""Thin wrapper around the GitHub REST API.
 
-We shell out to `gh` instead of using the REST API directly so students don't
-need to manage a PAT — `gh auth login` is enough.
+We talk to GitHub directly via `httpx` instead of shelling out to `gh`, so
+students don't need a `gh` binary — just `GITHUB_TOKEN` in `.env`.
 """
 
 from __future__ import annotations
 
-import json
+import os
 import re
-import shutil
-import subprocess
 from dataclasses import dataclass
 
+import httpx
 
+
+API = "https://api.github.com"
 PR_URL_RE = re.compile(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)")
 
 
@@ -31,9 +32,23 @@ class PullRequest:
     files_changed: list[str]
 
 
-def _require_gh() -> None:
-    if shutil.which("gh") is None:
-        raise RuntimeError("`gh` CLI not found on PATH. Install from https://cli.github.com/")
+def _token() -> str:
+    tok = os.environ.get("GITHUB_TOKEN")
+    if not tok:
+        raise RuntimeError(
+            "GITHUB_TOKEN is not set. Copy .env.example to .env and paste a Personal "
+            "Access Token (https://github.com/settings/tokens/new) with `public_repo` scope."
+        )
+    return tok
+
+
+def _headers(accept: str = "application/vnd.github+json") -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {_token()}",
+        "Accept": accept,
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Day27-HITL-Lab",
+    }
 
 
 def parse_pr_url(pr_url: str) -> tuple[str, str, int]:
@@ -44,25 +59,24 @@ def parse_pr_url(pr_url: str) -> tuple[str, str, int]:
 
 
 def fetch_pr(pr_url: str) -> PullRequest:
-    """Fetch PR metadata + unified diff via `gh`."""
-    _require_gh()
+    """Fetch PR metadata + unified diff via the GitHub REST API."""
     owner, repo, number = parse_pr_url(pr_url)
-    repo_slug = f"{owner}/{repo}"
+    base = f"{API}/repos/{owner}/{repo}/pulls/{number}"
 
-    meta_raw = subprocess.check_output(
-        [
-            "gh", "pr", "view", str(number),
-            "--repo", repo_slug,
-            "--json", "title,author,baseRefName,headRefName,headRefOid,files",
-        ],
-        text=True,
-    )
-    meta = json.loads(meta_raw)
+    with httpx.Client(timeout=30.0) as client:
+        meta_resp = client.get(base, headers=_headers())
+        meta_resp.raise_for_status()
+        meta = meta_resp.json()
 
-    diff = subprocess.check_output(
-        ["gh", "pr", "diff", str(number), "--repo", repo_slug],
-        text=True,
-    )
+        diff_resp = client.get(
+            base, headers=_headers(accept="application/vnd.github.v3.diff")
+        )
+        diff_resp.raise_for_status()
+        diff = diff_resp.text
+
+        files_resp = client.get(f"{base}/files", headers=_headers())
+        files_resp.raise_for_status()
+        files = [f["filename"] for f in files_resp.json()]
 
     return PullRequest(
         url=pr_url,
@@ -70,22 +84,23 @@ def fetch_pr(pr_url: str) -> PullRequest:
         repo=repo,
         number=number,
         title=meta["title"],
-        author=meta["author"]["login"],
-        base_ref=meta["baseRefName"],
-        head_ref=meta["headRefName"],
-        head_sha=meta["headRefOid"],
+        author=meta["user"]["login"],
+        base_ref=meta["base"]["ref"],
+        head_ref=meta["head"]["ref"],
+        head_sha=meta["head"]["sha"],
         diff=diff,
-        files_changed=[f["path"] for f in meta.get("files", [])],
+        files_changed=files,
     )
 
 
 def post_review_comment(pr: PullRequest, body: str) -> None:
-    """Post a top-level review comment back to the PR (used by stage 5)."""
-    _require_gh()
-    subprocess.check_call(
-        [
-            "gh", "pr", "comment", str(pr.number),
-            "--repo", f"{pr.owner}/{pr.repo}",
-            "--body", body,
-        ]
-    )
+    """Post a top-level discussion comment back to the PR.
+
+    Uses the Issues endpoint (PRs are issues under the hood for top-level
+    comments). For formal Approve/Request-changes use the Reviews endpoint
+    instead — which requires collaborator status on the target repo.
+    """
+    url = f"{API}/repos/{pr.owner}/{pr.repo}/issues/{pr.number}/comments"
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(url, headers=_headers(), json={"body": body})
+        resp.raise_for_status()

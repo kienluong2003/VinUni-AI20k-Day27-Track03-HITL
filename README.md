@@ -29,7 +29,7 @@ Thresholds live in `common/schemas.py` (`AUTO_APPROVE_THRESHOLD = 0.85`, `ESCALA
 │
 ├── common/                  # shared utilities — provided, don't modify
 │   ├── llm.py               # ChatOpenAI factory (OpenRouter)
-│   ├── github.py            # `gh` CLI wrapper: fetch_pr / post_review_comment
+│   ├── github.py            # httpx REST API client: fetch_pr / post_review_comment
 │   ├── db.py                # aiosqlite connection + write_audit_event
 │   └── schemas.py           # ReviewState (TypedDict) + PRAnalysis + AuditEntry (Pydantic)
 │
@@ -48,15 +48,14 @@ Thresholds live in `common/schemas.py` (`AUTO_APPROVE_THRESHOLD = 0.85`, `ESCALA
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) package manager
-- [`gh` CLI](https://cli.github.com/) — binary only, you'll auth via `GITHUB_TOKEN` below
 - An [OpenRouter](https://openrouter.ai/keys) API key (free tier has $1 credit)
 - A GitHub Personal Access Token — see next section
 
-No Docker, no Postgres install. Audit + checkpointer state both live in a single SQLite file (`./hitl_audit.db`) created automatically on first run.
+No Docker, no Postgres install, no `gh` CLI. The agent talks to GitHub directly via the REST API. Audit + checkpointer state both live in a single SQLite file (`./hitl_audit.db`) created automatically on first run.
 
 ## Get a GitHub Personal Access Token (PAT)
 
-The agent shells out to the `gh` CLI both to **read PR diffs** and to **post review comments** back to the PR.
+The agent calls the GitHub REST API directly to **read PR diffs** and **post review comments**. A PAT is required.
 
 1. Open <https://github.com/settings/tokens/new> (classic — simplest).
 2. Fill in:
@@ -70,10 +69,10 @@ The agent shells out to the `gh` CLI both to **read PR diffs** and to **post rev
    ```
 5. Verify:
    ```bash
-   GITHUB_TOKEN=$(grep ^GITHUB_TOKEN .env | cut -d= -f2) \
-     gh repo view VinUni-AI20k/PR-Demo
+   curl -sH "Authorization: Bearer $(grep ^GITHUB_TOKEN .env | cut -d= -f2)" \
+        https://api.github.com/repos/VinUni-AI20k/PR-Demo | grep '"full_name"'
    ```
-   If you see repo metadata → OK. `HTTP 401` → wrong scope or typo.
+   If you see `"full_name": "VinUni-AI20k/PR-Demo"` → OK. `401` → wrong scope or typo.
 
 **Security:** `.env` is git-ignored. Each student uses **their own** PAT — comments show their username, so the instructor can see who approved what.
 
@@ -209,10 +208,10 @@ You forgot `checkpointer=...` in `.compile()`. Checkpointer is required for `int
 **Graph restarts from scratch on resume.**
 `thread_id` mismatch between the original `invoke` and the resuming `Command` call. Always print `thread_id` and use the same one when resuming.
 
-**Duplicate `gh pr comment` calls after resume.**
+**Duplicate review comments posted after resume.**
 Side-effects placed *before* `interrupt()` in the same node — the node re-runs from the top after resume. Move side-effects to a downstream node (e.g. `commit`).
 
-**`gh pr comment` returns 403.**
+**`post_review_comment` returns 403 / 404.**
 Token lacks `public_repo` scope, or repo is private and you only have `public_repo`. Re-create the PAT with the right scope.
 
 **LLM stays overconfident on PR #2 and never escalates.**
