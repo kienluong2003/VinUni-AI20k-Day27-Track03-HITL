@@ -9,6 +9,49 @@ A 2-hour lab that builds a human-in-the-loop pull-request review agent in **Lang
 
 Students complete **4 exercises** (`exercises/`) that together build the full system. Each exercise has a runnable skeleton with `# TODO:` markers — your job is to fill them in.
 
+## Background — what problem does this solve?
+
+Code review is the bottleneck of most engineering teams: a senior engineer's time is finite, but PRs keep coming. PRs fall into roughly three buckets:
+
+- **Mechanical** (typo fixes, dependency bumps, one-line refactors) — safe, but still need someone to click "Approve". Spending senior time here is pure waste.
+- **Medium risk** (small features, schema additions) — usually fine, but a pair of human eyes catches edge cases. Reviewer time here pays off.
+- **High risk** (auth, migrations, anything security-touching) — definitely need a human, often with *specific questions* about intent and threat model.
+
+If you apply the same human-driven review process to all three, you burn senior bandwidth on trivial PRs **and** you also fail to give risky PRs the careful attention they deserve.
+
+### The HITL solution
+
+This lab builds an agent that auto-triages every PR:
+
+1. The LLM reads the diff and produces a structured review with a **self-reported confidence score**.
+2. **Confidence ≥ 85%** → the agent posts the review comment itself; no human in the loop.
+3. **60–85%** → the agent pauses (`interrupt()`) and shows the reviewer the diff + LLM reasoning + a one-click **approve / reject / edit** panel. On approve, the comment posts.
+4. **< 60%** → the agent **escalates**. It shows the reviewer *specific questions the LLM is uncertain about* ("Why MD5? Is `SYNC_URL` meant to be HTTPS in production?") and waits for answers. Then it re-asks the LLM with the answers in context and posts a **refined** review.
+
+Every step writes a row to a structured audit table — every routing decision, every human interaction, every LLM call — so the team can replay any session for compliance or debugging.
+
+### Flow diagram
+
+```mermaid
+flowchart TD
+    Start([PR opened on GitHub]) --> Fetch[fetch_pr<br/>via REST API]
+    Fetch --> Analyze[analyze<br/>LLM → structured PRAnalysis + confidence]
+    Analyze --> Route{route by<br/>confidence}
+    Route -- "≥ 85%" --> AutoApprove[auto_approve]
+    Route -- "60 – 85%" --> HumanApproval["human_approval<br/>interrupt()"]
+    Route -- "< 60%" --> Escalate["escalate<br/>interrupt() + questions"]
+    HumanApproval -- "approve / reject / edit" --> Commit[commit]
+    Escalate -- "answers" --> Synth[synthesize<br/>LLM refine with answers]
+    Synth --> Commit
+    AutoApprove --> Commit
+    Commit -- "approve OR escalated path" --> PostComment[POST review comment<br/>to GitHub]
+    Commit -- "reject" --> SkipPost[skip post]
+    PostComment --> END([END])
+    SkipPost --> END
+```
+
+Every node also writes one row to `audit_events`. The graph state is persisted by `AsyncSqliteSaver`, so an interrupted session can resume from exactly where it stopped — even after the process is killed.
+
 ## Lab assignment
 
 **Goal:** Build a HITL agent with LangGraph `interrupt()` **+ a Streamlit approval UI**.
