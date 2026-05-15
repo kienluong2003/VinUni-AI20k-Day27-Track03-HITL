@@ -1,16 +1,13 @@
 """Exercise 1 — Confidence scoring + routing.
-
 Build a small LangGraph that fetches a PR, analyzes it, then routes to one of
 three terminal nodes by confidence. Goal: see the three branches print
 different messages on different PRs.
-
 """
-
 from __future__ import annotations
 
 import argparse
-
 from dotenv import load_dotenv
+from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
 from rich.console import Console
 
@@ -23,7 +20,6 @@ from common.schemas import (
     ReviewState,
 )
 
-
 console = Console()
 
 
@@ -33,29 +29,73 @@ def node_fetch_pr(state: ReviewState) -> dict:
         pr = fetch_pr(state["pr_url"])
     console.print(f"  [green]✓[/green] {len(pr.files_changed)} files, head {pr.head_sha[:7]}")
     return {
-        "pr_title": pr.title, "pr_diff": pr.diff,
-        "pr_files": pr.files_changed, "pr_head_sha": pr.head_sha,
+        "pr_title": pr.title,
+        "pr_diff": pr.diff,
+        "pr_files": pr.files_changed,
+        "pr_head_sha": pr.head_sha,
+        "pr_author": pr.author,
     }
 
 
 def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
-    # TODO: call the LLM with structured output PRAnalysis.
-    # Hint:  llm = get_llm().with_structured_output(PRAnalysis)
-    #        analysis = llm.invoke([...])
-    #        return {"analysis": analysis}
-    # When implemented, wrap the call in:
-    #        with console.status("[dim]LLM thinking...[/dim]"):
-    #            analysis = llm.invoke([...])
-    raise NotImplementedError("Implement node_analyze")
+    llm = get_llm().with_structured_output(PRAnalysis)
+
+    system_prompt = """You are an expert code reviewer. Analyze the given pull request diff and produce a structured review.
+
+## Confidence score calibration (IMPORTANT)
+
+The confidence score (0.0–1.0) measures how complete and correct your review is — NOT how risky the PR is.
+
+| Score range | Meaning | Typical PR |
+|-------------|---------|------------|
+| > 0.72 | You have reviewed everything and are certain no important issue was missed | Typo fix, dependency bump, tiny refactor, formatting |
+| 0.59 – 0.72 | You found issues but one or two questions remain that a human should confirm | Small feature, schema addition, straightforward logic change |
+| < 0.59 | Significant uncertainty — security red flags, missing context, multiple ambiguous patterns | Auth code, password handling, SQL queries, cloud sync, no tests |
+
+Be honest: most small features deserve 0.60–0.68. Only genuinely trivial PRs deserve > 0.72.
+Only assign < 0.59 when there are concrete security issues or you truly cannot assess correctness without more context.
+
+## Your tasks
+1. Summarize what the PR does (one paragraph).
+2. List risk factors you observed.
+3. Propose specific review comments (file, line if known, severity, body).
+4. Assign a confidence score using the table above.
+5. Explain your reasoning for that score in confidence_reasoning.
+6. If score < 0.59, populate escalation_questions with specific questions to ask the human reviewer."""
+
+    human_prompt = f"""PR Title: {state['pr_title']}
+Author: {state.get('pr_author', 'unknown')}
+Files changed: {', '.join(state['pr_files'])}
+
+Diff:
+{state['pr_diff']}
+
+Please analyze this PR and provide a structured review."""
+
+    with console.status("[dim]LLM thinking...[/dim]"):
+        analysis = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=human_prompt),
+        ])
+
+    console.print(f"  [green]✓[/green] confidence = {analysis.confidence:.0%} | {len(analysis.comments)} comment(s)")
+    return {"analysis": analysis}
 
 
 def node_route(state: ReviewState) -> dict:
     console.print("[cyan]→ route[/cyan]")
-    # TODO: read state["analysis"].confidence and return
-    #       {"decision": "auto_approve" | "human_approval" | "escalate"}
-    # Thresholds provided: AUTO_APPROVE_THRESHOLD (0.85) and ESCALATE_THRESHOLD (0.60).
-    raise NotImplementedError("Implement node_route")
+    confidence = state["analysis"].confidence
+
+    if confidence >= AUTO_APPROVE_THRESHOLD:
+        decision = "auto_approve"
+    elif confidence < ESCALATE_THRESHOLD:
+        decision = "escalate"
+    else:
+        decision = "human_approval"
+
+    console.print(f"  confidence={confidence:.0%} → [bold]{decision}[/bold]")
+    return {"decision": decision}
 
 
 def node_auto_approve(state: ReviewState) -> dict:
@@ -73,13 +113,43 @@ def node_escalate(state: ReviewState) -> dict:
     return {"final_action": "pending_escalation"}
 
 
+def route_by_confidence(state: ReviewState) -> str:
+    """Conditional edge: return the node name to go to next."""
+    return state["decision"]
+
+
 def build_graph():
     g = StateGraph(ReviewState)
-    # TODO: add_node for the 6 nodes above (fetch_pr, analyze, route, auto_approve, human_approval, escalate)
-    # TODO: add_edge from START → fetch_pr → analyze → route
-    # TODO: add_conditional_edges on "route" with mapping
-    #       {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"}
-    # TODO: add_edge from each terminal node → END
+
+    # Add nodes
+    g.add_node("fetch_pr", node_fetch_pr)
+    g.add_node("analyze", node_analyze)
+    g.add_node("route", node_route)
+    g.add_node("auto_approve", node_auto_approve)
+    g.add_node("human_approval", node_human_approval)
+    g.add_node("escalate", node_escalate)
+
+    # Linear edges
+    g.add_edge(START, "fetch_pr")
+    g.add_edge("fetch_pr", "analyze")
+    g.add_edge("analyze", "route")
+
+    # Conditional routing from "route" node
+    g.add_conditional_edges(
+        "route",
+        route_by_confidence,
+        {
+            "auto_approve": "auto_approve",
+            "human_approval": "human_approval",
+            "escalate": "escalate",
+        },
+    )
+
+    # Terminal edges
+    g.add_edge("auto_approve", END)
+    g.add_edge("human_approval", END)
+    g.add_edge("escalate", END)
+
     return g.compile()
 
 

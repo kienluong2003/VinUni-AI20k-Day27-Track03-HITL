@@ -35,16 +35,46 @@ def node_fetch_pr(state: ReviewState) -> dict:
     with console.status("[dim]Fetching PR from GitHub...[/dim]"):
         pr = fetch_pr(state["pr_url"])
     console.print(f"  [green]✓[/green] {len(pr.files_changed)} files, head {pr.head_sha[:7]}")
-    return {"pr_title": pr.title, "pr_diff": pr.diff, "pr_files": pr.files_changed, "pr_head_sha": pr.head_sha}
+    return {
+        "pr_title": pr.title,
+        "pr_diff": pr.diff,
+        "pr_files": pr.files_changed,
+        "pr_head_sha": pr.head_sha,
+        "pr_author": pr.author,
+    }
 
 
 def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
     llm = get_llm().with_structured_output(PRAnalysis)
+
+    system_prompt = """You are an expert code reviewer. Analyze the given pull request diff and produce a structured review.
+
+## Confidence score calibration (IMPORTANT)
+
+The confidence score (0.0–1.0) measures how complete and correct your review is — NOT how risky the PR is.
+
+| Score range | Meaning | Typical PR |
+|-------------|---------|------------|
+| > 0.72 | You have reviewed everything and are certain no important issue was missed | Typo fix, dependency bump, tiny refactor, formatting |
+| 0.58 – 0.72 | You found issues but one or two questions remain that a human should confirm | Small feature, schema addition, straightforward logic change |
+| < 0.58 | Significant uncertainty — security red flags, missing context, multiple ambiguous patterns | Auth code, password handling, SQL queries, cloud sync, no tests |
+
+Be honest: most small features deserve 0.60–0.68. Only genuinely trivial PRs deserve > 0.72.
+Only assign < 0.58 when there are concrete security issues or you truly cannot assess correctness without more context.
+
+## Your tasks
+1. Summarize what the PR does (one paragraph).
+2. List risk factors you observed.
+3. Propose specific review comments (file, line if known, severity, body).
+4. Assign a confidence score using the table above.
+5. Explain your reasoning for that score in confidence_reasoning.
+6. If score < 0.58, populate escalation_questions with specific questions to ask the human reviewer."""
+
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
-            {"role": "system", "content": "Senior reviewer. Structured output."},
-            {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"PR Title: {state['pr_title']}\nAuthor: {state.get('pr_author', 'unknown')}\nFiles changed: {', '.join(state['pr_files'])}\n\nDiff:\n{state['pr_diff']}"},
         ])
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.comments)} comment(s)")
     return {"analysis": analysis}
@@ -53,9 +83,12 @@ def node_analyze(state: ReviewState) -> dict:
 def node_route(state: ReviewState) -> dict:
     console.print("[cyan]→ route[/cyan]")
     c = state["analysis"].confidence
-    if c >= AUTO_APPROVE_THRESHOLD: decision = "auto_approve"
-    elif c < ESCALATE_THRESHOLD:    decision = "escalate"
-    else:                           decision = "human_approval"
+    if c >= AUTO_APPROVE_THRESHOLD:
+        decision = "auto_approve"
+    elif c < ESCALATE_THRESHOLD:
+        decision = "escalate"
+    else:
+        decision = "human_approval"
     console.print(f"  [green]✓[/green] decision=[bold]{decision}[/bold] (confidence={c:.0%})")
     return {"decision": decision}
 
@@ -63,17 +96,24 @@ def node_route(state: ReviewState) -> dict:
 def node_human_approval(state: ReviewState) -> dict:
     """Pause and ask the human."""
     a = state["analysis"]
-    # TODO: call interrupt(payload) where payload contains these fields:
-    #         "kind": "approval_request",
-    #         "confidence": a.confidence,
-    #         "confidence_reasoning": a.confidence_reasoning,
-    #         "summary": a.summary,
-    #         "comments": [c.model_dump() for c in a.comments],
-    #         "diff_preview": state["pr_diff"][:2000],
-    # interrupt() returns whatever the caller passes via Command(resume=...).
-    # response = interrupt(...)
-    # return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
-    raise NotImplementedError("Call interrupt() with an approval_request payload")
+
+    # Call interrupt() with the approval_request payload.
+    # The graph pauses here and returns control to main().
+    # Execution resumes when main() calls app.invoke(Command(resume=...)).
+    response = interrupt({
+        "kind": "approval_request",
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "comments": [c.model_dump() for c in a.comments],
+        "diff_preview": state["pr_diff"][:2000],
+    })
+
+    # response is whatever the caller passed via Command(resume=response)
+    return {
+        "human_choice": response["choice"],
+        "human_feedback": response.get("feedback"),
+    }
 
 
 def _render_comment_body(state: ReviewState) -> str:
@@ -111,30 +151,38 @@ def node_auto_approve(state):
     return {"final_action": _post(state, "auto_approved")}
 
 
-def node_escalate(state):     return {"final_action": "pending_escalation"}
+def node_escalate(state):
+    return {"final_action": "pending_escalation"}
 
 
 def build_graph():
     g = StateGraph(ReviewState)
     for name, fn in [
-        ("fetch_pr", node_fetch_pr), ("analyze", node_analyze), ("route", node_route),
-        ("auto_approve", node_auto_approve), ("human_approval", node_human_approval),
-        ("escalate", node_escalate), ("commit", node_commit),
+        ("fetch_pr", node_fetch_pr),
+        ("analyze", node_analyze),
+        ("route", node_route),
+        ("auto_approve", node_auto_approve),
+        ("human_approval", node_human_approval),
+        ("escalate", node_escalate),
+        ("commit", node_commit),
     ]:
         g.add_node(name, fn)
+
     g.add_edge(START, "fetch_pr")
     g.add_edge("fetch_pr", "analyze")
     g.add_edge("analyze", "route")
     g.add_conditional_edges(
-        "route", lambda s: s["decision"],
+        "route",
+        lambda s: s["decision"],
         {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"},
     )
     g.add_edge("auto_approve", END)
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     g.add_edge("escalate", END)
-    # TODO: compile with checkpointer=MemorySaver()
-    return g.compile()
+
+    # checkpointer=MemorySaver() là bắt buộc để interrupt() hoạt động
+    return g.compile(checkpointer=MemorySaver())
 
 
 def prompt_human(payload: dict) -> dict:
@@ -174,12 +222,12 @@ def main() -> None:
 
     result = app.invoke({"pr_url": args.pr, "thread_id": thread_id}, cfg)
 
-    # TODO: write a `while "__interrupt__" in result:` loop:
-    #   - take payload from result["__interrupt__"][0].value
-    #   - call prompt_human(payload)
-    #   - resume with app.invoke(Command(resume=<answer>), cfg)
-    # while "__interrupt__" in result:
-    #     ...
+    # Resume loop: graph pauses at interrupt(), main() prompts the human,
+    # then resumes the graph with Command(resume=answer).
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        answer = prompt_human(payload)
+        result = app.invoke(Command(resume=answer), cfg)
 
     console.rule("Done")
     console.print(result.get("final_action"))
